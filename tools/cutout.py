@@ -30,16 +30,30 @@ OUT_DIR = os.path.join(ROOT, "assets", "dogs")   # 直接写进游戏素材目�
 CANVAS = 512          # 输出画布边长（和 game.js 的贴图约定一致）
 FILL = 0.92           # 主体占画布长边的比例（= game.js 的 ASSET_FILL）
 WORK = 480            # 算遮罩时的工作分辨率
-SEED_THR = 12         # 第一步：认定「肯定是背景」的严容差
+SEED_THR = 5          # 第一步：认定「肯定是背景」的严容差（必须小，见 FLAT_STD 那段注释）
 MODEL_THR = 20        # 第二步：跟背景色地图比，差多少算前景
 GAP = 0.025           # 离狗多近的碎块算「同一只狗」（相对长边）
 CLOSE = 0.012         # 形态学闭运算的半径（相对长边），把断开的线稿接起来
 FILL_R = 0.034        # 填肚子用的闭运算半径：先让轮廓闭合，再灌成实心
 DESPILL_THR = 44      # 判定「这是漏进来的背景色」的容差
 
-# 这几张图的背景是极干净的单色，而且和狗身的白只差 1 级（背景 254 / 狗身 255）：
-# 用容差法会把狗身当背景吃掉，成品上表现为狗身上裂开一道缝。改用零容差 + 连通分割。
-EXACT_BG_SLUGS = {"04-sit"}
+# 背景是「一整块纯色」的图（四条边几乎 100% 同一个颜色）走「零容差 + 剥毛边」的分割：
+#   先从四条边往里灌，只把「和背景色一模一样」的像素连成背景（这一步绝不啃到狗），
+#   再一圈一圈往外剥最多 BG_LAYERS 层「跟背景色差一点点」的像素，吃掉 JPEG 噪点毛边。
+# 为什么第一步容差必须为 0：
+#   * 04 坐坐狗背景 254、狗身 255，只差一级，容差一大狗身就被吃掉（会裂一条缝）；
+#   * 05 站站狗背景是红、狗身是棕，两者之间是渐变过渡，
+#     容差一大会顺着渐变一路爬进狗肚子，狗身被当成背景后又被去溢色刷成一片白
+#     （这就是「扣多了、里面不是白色」的根因）。
+FLAT_STD = 0.6        # 判定「边缘够不够平」的标准差阈值
+FLAT_FRAC = 0.95      # 判定「边缘够不够纯」的主色占比阈值
+BG_TOL = 8            # 剥毛边时允许的色差：JPEG 噪点会让背景在 ±2 之间跳
+BG_LAYERS = 4         # 最多往外剥几层（剥不动就停，狗的黑描边/肉色跟背景差得远）
+
+# 04 坐坐狗是特例：背景 254、狗身 255，只差一级。
+# 对它来说「差一点点的背景色」和「狗身」根本分不开，容差必须锁死为 0，
+# 否则区域生长会顺着 255 的狗身一路啃进去（上一版的裂缝就是这么来的）。
+BG_TOL_BY_SLUG = {"04-sit": (0, 0)}
 
 # 源文件顺序 = 用户给的「从小到大」顺序；这里同时定了游戏里的等级顺序
 SLUGS = ["01-pup", "02-drop", "03-roll", "04-sit", "05-stand",
@@ -50,12 +64,23 @@ MANUAL_ERASE = {}
 
 
 # ---------------------------------------------------------------- 基础工具
+RESAMPLE_BOX = getattr(Image, "Resampling", Image).BOX
+
+
 def load_work(path, work=WORK):
+    """缩到工作分辨率。
+
+    这里必须用「面积平均」（BOX）而不是 LANCZOS：
+    LANCZOS 会在边缘外侧振铃，把纯色背景变成 248,114,102 这种差一级的颜色，
+    而纯色底是靠「和背景色一模一样」来判定的（容差 0），振铃一出现就会被当成狗，
+    成品上就是描边外面一圈背景色的毛边（05 站站狗的红边就是这么来的）。
+    面积平均只在真正混色的像素上取平均，纯色区域原样保留，振铃为零。
+    """
     im = Image.open(path).convert("RGB")
     w, h = im.size
     s = min(1.0, work / max(w, h))
     if s < 1.0:
-        im = im.resize((max(1, int(round(w * s))), max(1, int(round(h * s)))), Image.LANCZOS)
+        im = im.resize((max(1, int(round(w * s))), max(1, int(round(h * s)))), RESAMPLE_BOX)
     return im
 
 
@@ -249,18 +274,30 @@ def subject_mask(rgb):
     return solid, dropped, model
 
 
-def exact_background(rgb):
-    """背景是极干净的单色时，直接按「精确等于背景色 + 从四条边连通」框背景。
-
-    零容差是关键：容差一大，狗身那层白（255）就会被算成背景（254）一起吃掉。
-    返回 (背景掩码, 背景色, 背景是否够平整)。
-    """
-    h, w, _ = rgb.shape
+def border_stats(rgb):
+    """看四条边：返回 (背景色, 主色占比, 边缘标准差, 边缘像素)。"""
     border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]]).reshape(-1, 3)
     cols, counts = np.unique(border, axis=0, return_counts=True)
-    bgcol = cols[counts.argmax()].astype(np.int16)
-    flat = float(border.astype(np.int16).std(axis=0).mean()) < 0.5
-    cand = np.abs(rgb.astype(np.int16) - bgcol).max(axis=2) == 0
+    k = int(counts.argmax())
+    return (cols[k].astype(np.int16),
+            float(counts[k]) / float(len(border)),
+            float(border.astype(np.float32).std(axis=0).mean()),
+            border)
+
+
+def dilate4(m):
+    """4 邻域膨胀一圈。"""
+    out = m.copy()
+    out[1:] |= m[:-1]
+    out[:-1] |= m[1:]
+    out[:, 1:] |= m[:, :-1]
+    out[:, :-1] |= m[:, 1:]
+    return out
+
+
+def flood_from_border(cand):
+    """从四条边往里灌：只有 cand 为真的像素才连得通。"""
+    h, w = cand.shape
     vis = np.zeros((h, w), bool)
     dq = deque()
 
@@ -281,18 +318,64 @@ def exact_background(rgb):
             ny, nx = y + dy, x + dx
             if 0 <= ny < h and 0 <= nx < w:
                 seed(ny, nx)
-    return vis, bgcol, flat
+    return vis
 
 
-def subject_mask_exact(rgb):
-    """精确背景色版的取主体：不给 model，调用方据此跳过去溢色。"""
-    bg, _bgcol, _flat = exact_background(rgb)
-    fg = ~bg
-    if not fg.any():
-        raise RuntimeError("精确背景色模式下找不到前景")
-    lab, sizes = components(fg)
+def is_flat_bg(rgb):
+    """这张图是不是「一整块纯色底」。"""
+    _bgcol, frac, std, _border = border_stats(rgb)
+    return std < FLAT_STD and frac >= FLAT_FRAC
+
+
+def background_layers(rgb, slug=None):
+    """算背景。
+
+    返回 (vis0, vis1)：
+      vis0 —— 只认「和背景色一模一样」的像素，绝对稳，绝不会啃到狗；
+      vis1 —— 在 vis0 基础上最多往外剥 BG_LAYERS 层「和背景色差一点点」的
+              像素，用来吃掉 JPEG 噪点 / 缩放噪点在描边外留下的一圈毛边。
+    剥不动就会自己停下：狗的黑描边和肉色跟背景差得远，永远剥不过去。
+    """
+    bgcol, frac, std, border = border_stats(rgb)
+    if std < FLAT_STD and frac >= FLAT_FRAC:
+        tol, layers = BG_TOL, BG_LAYERS
+    else:
+        d0 = np.abs(border.astype(np.int16) - bgcol).max(axis=1)
+        tol = max(3, min(int(np.ceil(np.percentile(d0, 99.5))) + 2, 28))
+        layers = 1
+    if slug and slug in BG_TOL_BY_SLUG:
+        tol, layers = BG_TOL_BY_SLUG[slug]
+    d = np.abs(rgb.astype(np.int16) - bgcol).max(axis=2)
+    vis0 = flood_from_border(d <= 0)
+    vis = vis0
+    if layers > 0:
+        near = d <= tol
+        for _ in range(layers):
+            # 一圈一圈往外剥（一次一圈，别一次把整片「接近背景色」的区域吞掉）
+            front = dilate4(vis) & near & ~vis
+            if not front.any():
+                break
+            vis = vis | front
+    return vis0, vis
+
+
+def background_mask(rgb, slug=None):
+    return background_layers(rgb, slug)[1]
+
+
+def subject_mask_exact(rgb, slug=None):
+    """纯色底版的取主体：不给 model，调用方据此跳过去溢色。"""
+    vis0, vis1 = background_layers(rgb, slug)
+    fg0 = ~vis0
+    if not fg0.any():
+        raise RuntimeError("纯色底模式下找不到前景")
+    lab, sizes = components(fg0)
     subj, dropped = pick_subject(lab, sizes)
-    return close_mask(subj, 1), dropped, None
+    solid = fill_holes(close_mask(subj, 1))
+    # 主体连通性以「零容差」那版为准，毛边只是最后再削掉一圈：
+    # 这样剥毛边不会把细腿细尾巴切断，更不会让整只狗被拆成几块。
+    solid = solid & ~(vis1 & ~vis0)
+    return solid, dropped, None
 
 
 def despill(rgb, alpha, model, thr=DESPILL_THR, fill=(255, 255, 255)):
@@ -311,12 +394,12 @@ def despill(rgb, alpha, model, thr=DESPILL_THR, fill=(255, 255, 255)):
 def build(path, slug):
     work = load_work(path)
     rgb_w = np.asarray(work)
-    if slug in EXACT_BG_SLUGS:
-        fg_main, dropped, model_w = subject_mask_exact(rgb_w)
+    if is_flat_bg(rgb_w):
+        # 纯色底：取主体时已经灌过实心，也不用去溢色
+        fg_main, dropped, model_w = subject_mask_exact(rgb_w, slug)
     else:
         fg_main, dropped, model_w = subject_mask(rgb_w)
-    seed = grow_background(rgb_w, SEED_THR)
-    fg_main = fill_holes(fg_main)
+        fg_main = fill_holes(fg_main)
     dropped = [(s, float(s) / fg_main.size) for s, _ in dropped]
 
     full = Image.open(path).convert("RGB")
