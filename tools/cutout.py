@@ -37,6 +37,10 @@ CLOSE = 0.012         # 形态学闭运算的半径（相对长边），把断�
 FILL_R = 0.034        # 填肚子用的闭运算半径：先让轮廓闭合，再灌成实心
 DESPILL_THR = 44      # 判定「这是漏进来的背景色」的容差
 
+# 这几张图的背景是极干净的单色，而且和狗身的白只差 1 级（背景 254 / 狗身 255）：
+# 用容差法会把狗身当背景吃掉，成品上表现为狗身上裂开一道缝。改用零容差 + 连通分割。
+EXACT_BG_SLUGS = {"04-sit"}
+
 # 源文件顺序 = 用户给的「从小到大」顺序；这里同时定了游戏里的等级顺序
 SLUGS = ["01-pup", "02-drop", "03-roll", "04-sit", "05-stand",
          "06-long", "07-bib", "08-puff", "09-big", "10-god"]
@@ -245,6 +249,52 @@ def subject_mask(rgb):
     return solid, dropped, model
 
 
+def exact_background(rgb):
+    """背景是极干净的单色时，直接按「精确等于背景色 + 从四条边连通」框背景。
+
+    零容差是关键：容差一大，狗身那层白（255）就会被算成背景（254）一起吃掉。
+    返回 (背景掩码, 背景色, 背景是否够平整)。
+    """
+    h, w, _ = rgb.shape
+    border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]]).reshape(-1, 3)
+    cols, counts = np.unique(border, axis=0, return_counts=True)
+    bgcol = cols[counts.argmax()].astype(np.int16)
+    flat = float(border.astype(np.int16).std(axis=0).mean()) < 0.5
+    cand = np.abs(rgb.astype(np.int16) - bgcol).max(axis=2) == 0
+    vis = np.zeros((h, w), bool)
+    dq = deque()
+
+    def seed(y, x):
+        if cand[y, x] and not vis[y, x]:
+            vis[y, x] = True
+            dq.append((y, x))
+
+    for x in range(w):
+        seed(0, x)
+        seed(h - 1, x)
+    for y in range(h):
+        seed(y, 0)
+        seed(y, w - 1)
+    while dq:
+        y, x = dq.popleft()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w:
+                seed(ny, nx)
+    return vis, bgcol, flat
+
+
+def subject_mask_exact(rgb):
+    """精确背景色版的取主体：不给 model，调用方据此跳过去溢色。"""
+    bg, _bgcol, _flat = exact_background(rgb)
+    fg = ~bg
+    if not fg.any():
+        raise RuntimeError("精确背景色模式下找不到前景")
+    lab, sizes = components(fg)
+    subj, dropped = pick_subject(lab, sizes)
+    return close_mask(subj, 1), dropped, None
+
+
 def despill(rgb, alpha, model, thr=DESPILL_THR, fill=(255, 255, 255)):
     """轮廓内部还留着「局部的背景色」（线稿是镂空的）→ 刷成白色，跟其它贴图统一。
 
@@ -261,7 +311,10 @@ def despill(rgb, alpha, model, thr=DESPILL_THR, fill=(255, 255, 255)):
 def build(path, slug):
     work = load_work(path)
     rgb_w = np.asarray(work)
-    fg_main, dropped, model_w = subject_mask(rgb_w)
+    if slug in EXACT_BG_SLUGS:
+        fg_main, dropped, model_w = subject_mask_exact(rgb_w)
+    else:
+        fg_main, dropped, model_w = subject_mask(rgb_w)
     seed = grow_background(rgb_w, SEED_THR)
     fg_main = fill_holes(fg_main)
     dropped = [(s, float(s) / fg_main.size) for s, _ in dropped]
@@ -287,15 +340,22 @@ def build(path, slug):
 
     m = Image.fromarray((fg_main * 255).astype(np.uint8)).resize((W, H), Image.LANCZOS)
     alpha = np.asarray(m).astype(np.float32)
+    if model_w is None:
+        # 精确背景色走的是 0/255 硬边，轻轻糊一下再重映射，边缘才不会有锯齿
+        alpha = np.asarray(Image.fromarray(alpha.astype(np.uint8))
+                           .filter(ImageFilter.GaussianBlur(0.6))).astype(np.float32)
     alpha = np.clip((alpha - 60) * (255.0 / 130.0), 0, 255).astype(np.uint8)
 
     rgb = np.asarray(full).copy()
-    model = np.empty((H, W, 3), np.float32)
-    for c in range(3):
-        model[..., c] = np.asarray(
-            Image.fromarray(model_w[..., c].astype(np.float32)).resize((W, H), Image.LANCZOS),
-            dtype=np.float32)
-    rgb2, nspill = despill(rgb, alpha, model)
+    if model_w is None:
+        rgb2, nspill = rgb, 0
+    else:
+        model = np.empty((H, W, 3), np.float32)
+        for c in range(3):
+            model[..., c] = np.asarray(
+                Image.fromarray(model_w[..., c].astype(np.float32)).resize((W, H), Image.LANCZOS),
+                dtype=np.float32)
+        rgb2, nspill = despill(rgb, alpha, model)
 
     ys, xs = np.nonzero(alpha > 128)
     if len(ys) == 0:
