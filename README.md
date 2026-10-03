@@ -6,6 +6,12 @@
 美术换成了用户提供的 **10 张线条小狗图**（脚本自动抠图 + 去水印），物理、合成、判负、
 复活、排行榜等逻辑沿用并适配原作的管线。
 
+## 在线玩
+
+**<https://young-cy-code.github.io/Maltese-game/>**
+
+手机、电脑打开就能玩，不用装任何东西。源码仓库：[Young-cy-code/Maltese-game](https://github.com/Young-cy-code/Maltese-game)。
+
 ## 预览
 
 ![预览](preview.png)
@@ -153,6 +159,7 @@ python tools/make_blur.py                 # 生成 blur.js 占位图
 
 - **GitHub Pages**：把整个目录推到仓库的 `main` 分支，仓库 Settings → Pages → Source 选
   `main` / `/(root)`，一两分钟后就能拿到公网链接。
+  本仓库已经开好了，地址就是上面那个 <https://young-cy-code.github.io/Maltese-game/>。
 - **Netlify / Vercel**：把文件夹直接拖进它们的网页控制台，或连仓库自动部署。
 - **只想自己玩**：见上面的「本地运行」。
 
